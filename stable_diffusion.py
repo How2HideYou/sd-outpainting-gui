@@ -1,5 +1,6 @@
 import asyncio
 from functools import lru_cache
+import logging
 import threading
 from typing import Any, Literal, Optional
 import enum
@@ -9,6 +10,9 @@ from io import BytesIO
 import numpy as np
 import httpx
 from PIL import Image
+
+
+_LOG = logging.getLogger(__name__)
 
 
 class Direction(enum.Enum):
@@ -117,6 +121,7 @@ class StableDiffusion:
 
 
     async def _generate(self, __img:Image.Image, __dir:Direction, mask_blur:int, image_size:int, **kwargs) -> Image.Image:
+        _LOG.info(f'生成リクエストを送信します 生成サイズ: ({image_size}, {image_size})')
         response = await self.client.post('img2img', timeout=60*30, json=dict(
             restore_faces=False,
             tiling=False,
@@ -134,6 +139,7 @@ class StableDiffusion:
 
     async def interrupt_generation(self):
         "APIに生成の中止をリクエストする"
+        _LOG.info(f'生成の中止をリクエストします')
         response = await self.client.post('interrupt')
         response.raise_for_status()
 
@@ -147,7 +153,6 @@ class StableDiffusion:
 
     async def get_sampler_or_scheduler_names(self, kind:Literal['samplers', 'schedulers']) -> list[str]:
         response = await self.client.get(kind)
-        print(response)
         if response.is_success:
             root = response.json()
             return [ item['name'] for item in root ]

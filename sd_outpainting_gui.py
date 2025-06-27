@@ -1,13 +1,17 @@
 import asyncio
 from collections.abc import Generator
+from concurrent.futures import Future
 from contextlib import contextmanager
+import logging
 from typing import Annotated, Any, Optional, TypeVar
-import traceback
 
 import wx, wx.lib.scrolledpanel
 from PIL import Image
 
 from stable_diffusion import DEFAULT_OPTIONS, Direction, StableDiffusion, Status
+
+
+_LOG = logging.getLogger(__name__)
 
 
 IMAGE_SIZE = 512
@@ -59,26 +63,33 @@ class SizerStack:
             self.stack.pop()
 
 
-class SDOptions:
+class SDOptions(wx.CollapsiblePane):
     stable_diffusion: StableDiffusion
     controls: dict[str, wx.Control]
 
-    def __init__(self, stable_diffusion:StableDiffusion, parent:wx.Window, sizers:SizerStack):
+    def __init__(self, parent:wx.Window, stable_diffusion:StableDiffusion, **kwargs):
+        super().__init__(parent, **kwargs)
         self.stable_diffusion = stable_diffusion
+
+        pane = self.GetPane()
+
         self.controls = {
-            'prompt':          wx.TextCtrl(parent),
-            'negative_prompt': wx.TextCtrl(parent),
-            'steps':           wx.SpinCtrl(parent, min=1, max=200),
-            'cfg_scale':       wx.SpinCtrl(parent, min=1, max=100),
-            'mask_blur':       wx.SpinCtrl(parent, min=0, max=256),
-            'sampler_name':    wx.ComboBox(parent),
-            'scheduler':       wx.ComboBox(parent),
+            'prompt':          wx.TextCtrl(pane),
+            'negative_prompt': wx.TextCtrl(pane),
+            'steps':           wx.SpinCtrl(pane, min=1, max=200),
+            'cfg_scale':       wx.SpinCtrl(pane, min=1, max=100),
+            'mask_blur':       wx.SpinCtrl(pane, min=0, max=256),
+            'sampler_name':    wx.ComboBox(pane),
+            'scheduler':       wx.ComboBox(pane),
         }
-        with sizers.sizer(wx.FlexGridSizer(len(self.controls), 2, 3, 3), flag=wx.EXPAND) as sizer:
-            sizer.AddGrowableCol(1, 1)
-            for key, ctrl in self.controls.items():
-                sizers.Add(wx.StaticText(parent, label=key), flag=wx.ALIGN_CENTER_VERTICAL)
-                sizers.Add(ctrl, 1, wx.EXPAND if isinstance(ctrl, wx.TextCtrl) else 0)
+        sizer = wx.FlexGridSizer(len(self.controls), 2, 3, 3)
+        pane.SetSizer(sizer)
+        sizer.AddGrowableCol(1, 1)
+        for key, ctrl in self.controls.items():
+            sizer.Add(wx.StaticText(pane, label=key), flag=wx.ALIGN_CENTER_VERTICAL)
+            sizer.Add(ctrl, 1, wx.EXPAND if isinstance(ctrl, wx.TextCtrl) else 0)
+        
+        self.Bind(wx.EVT_COLLAPSIBLEPANE_CHANGED, lambda _: parent.SendSizeEvent()) # 開閉時に親のレイアウトを再計算させる
 
     async def fill_in_combo_box_choices(self):
         samplers   = await self.stable_diffusion.get_sampler_or_scheduler_names('samplers')
@@ -113,6 +124,7 @@ class MainFrame(wx.Frame):
     n_consecutive_control:  wx.SpinCtrl
     generate_cancel_button: wx.Button
     consecutive_gen_button: wx.Button
+    check_api_button:       wx.Button
     progress_bar:           wx.Gauge
 
     sd_options:    SDOptions
@@ -183,12 +195,21 @@ class MainFrame(wx.Frame):
                 self.consecutive_gen_button.Bind(wx.EVT_BUTTON, lambda _: asyncio.run_coroutine_threadsafe(self._generate_coroutine(self.n_consecutive_control.GetValue()), self.stable_diffusion.event_loop))
                 self.consecutive_gen_button.Enabled = False
 
+                sizers.Add(wx.StaticLine(root_panel, style=wx.LI_VERTICAL), 1, wx.EXPAND)
+
+                # 「APIを確認」ボタン
+                self.check_api_button = wx.Button(root_panel, label='APIを確認', size=wx.Size(100, 40))
+                sizers.Add(self.check_api_button, flag=wx.ALIGN_CENTER_VERTICAL)
+                self.check_api_button.Bind(wx.EVT_BUTTON, lambda _: self.check_api())
+
+
             # プログレスバー
             self.progress_bar = wx.Gauge(root_panel, range=100)
             sizers.Add(self.progress_bar, 0, border=6, flag=wx.EXPAND)
 
-            self.sd_options = SDOptions(stable_diffusion, root_panel, sizers)
-            print(self.sd_options.to_dict())
+            self.sd_options = SDOptions(root_panel, stable_diffusion, label='オプション'+' '*600)
+            sizers.Add(self.sd_options, 0, border=6, flag=wx.EXPAND)
+            _LOG.info(f'デフォルトの生成オプション: {self.sd_options.to_dict()}')
 
             self.scrolled_panel = wx.lib.scrolledpanel.ScrolledPanel(root_panel, size=wx.Size(IMAGE_SIZE, IMAGE_SIZE))
             self.canvas = wx.Panel(self.scrolled_panel, size=wx.Size(IMAGE_SIZE, IMAGE_SIZE))
@@ -225,13 +246,36 @@ class MainFrame(wx.Frame):
         self.SetSize(wx.Size(600, 900))
         self.set_status('idle')
 
-        async def _check_api_status():
+        self.check_api()
+
+
+    def check_api(self) -> Future[bool]:
+        "APIが起動していることをチェックし、コンボボックスの選択肢を埋める"
+
+        async def _check_api() -> bool:
+            _LOG.info('APIをチェックします...')
             try:
                 await self.stable_diffusion.get_generation_progress()
             except:
                 wx.CallAfter(lambda: self.SetStatusText('APIにアクセスできません'))
-        asyncio.run_coroutine_threadsafe(_check_api_status(), self.stable_diffusion.event_loop)
-        asyncio.run_coroutine_threadsafe(self.sd_options.fill_in_combo_box_choices(), self.stable_diffusion.event_loop)
+                _LOG.exception('APIにアクセスできません')
+                return False
+            _LOG.info('コンボボックスの選択肢を取得し設定します...')
+            _LOG.info('APIをチェックします...')
+            try:
+                await self.sd_options.fill_in_combo_box_choices()
+            except:
+                wx.CallAfter(lambda: self.SetStatusText('コンボボックスの選択肢の設定に失敗しました'))
+                _LOG.exception('コンボボックスの選択肢の設定に失敗しました')
+                return False
+            _LOG.info('コンボボックスの選択肢を設定しました')
+            wx.CallAfter(lambda: self.SetStatusText('APIの起動を確認しました'))
+            return True
+
+        self.check_api_button.Disable()
+        future = asyncio.run_coroutine_threadsafe(_check_api(), self.stable_diffusion.event_loop)
+        future.add_done_callback(lambda _: wx.CallAfter(self.check_api_button.Enable))
+        return future
 
 
     def set_image(self, image:Optional[Image.Image], snap_dir:Optional[Direction]=None):
@@ -244,7 +288,7 @@ class MainFrame(wx.Frame):
                 self.scrolled_panel.SetupScrolling()
                 match snap_dir:
                     case Direction.RIGHT:
-                        print(image.width - self.scrolled_panel.Size[0]) # type: ignore
+                        #print(image.width - self.scrolled_panel.Size[0]) # type: ignore
                         wx.CallAfter(lambda: self.scrolled_panel.Scroll(0x7FFFFFFF, 0))
                     case Direction.DOWN:
                         wx.CallAfter(lambda: self.scrolled_panel.Scroll(0, 0x7FFFFFFF))
@@ -304,7 +348,7 @@ class MainFrame(wx.Frame):
                     if path:
                         self.open_image_file(path)
                 except:
-                    traceback.print_exc()
+                    _LOG.exception('画像を開けませんでした')
                     wx.MessageDialog(self, '画像を開けませんでした', style=wx.ICON_ERROR).ShowModal()
             case wx.ID_SAVEAS:
                 if self.image is not None:
@@ -313,7 +357,7 @@ class MainFrame(wx.Frame):
                         if path:
                             self.image.save(path)
                     except:
-                        traceback.print_exc()
+                        _LOG.exception('画像の保存に失敗しました')
                         wx.MessageDialog(self, '画像の保存に失敗しました', style=wx.ICON_ERROR).ShowModal()
                 else:
                     wx.MessageDialog(self, '保存できる画像がありません', style=wx.ICON_WARNING).ShowModal()
@@ -376,7 +420,7 @@ class MainFrame(wx.Frame):
                 self.set_status('cancelling', '中断しています...')
                 await self.stable_diffusion.interrupt_generation()
         except:
-            traceback.print_exc()
+            _LOG.exception('生成中にエラーが発生しました')
 
     def open_image_file(self, path:str):
         img:Image.Image = Image.open(path)
@@ -396,4 +440,5 @@ def main():
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
     main()
